@@ -1,3 +1,10 @@
+//Updated PoA Clique Consensus Engine with sealing block rewards and maximum supply
+//2022 - iTachyons.io
+//The engine remains free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
 // Copyright 2017 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -20,7 +27,6 @@ package clique
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"math/big"
 	"math/rand"
@@ -67,6 +73,11 @@ var (
 
 	diffInTurn = big.NewInt(2) // Block difficulty for in-turn signatures
 	diffNoTurn = big.NewInt(1) // Block difficulty for out-of-turn signatures
+
+	FrontierBlockReward       = big.NewInt(5e+18) // Block reward in wei for successfully mining a block
+	ByzantiumBlockReward      = big.NewInt(3e+18) // Block reward in wei for successfully mining a block upward from Byzantium
+	ConstantinopleBlockReward = big.NewInt(2e+18) // Block reward in wei for successfully mining a block upward from Constantinople
+    MAX_SUPPLY = big.NewInt(1e+18)
 )
 
 // Various error messages to mark blocks invalid. These should be private to
@@ -180,7 +191,7 @@ type Clique struct {
 
 	signer common.Address // Ethereum address of the signing key
 	signFn SignerFn       // Signer function to authorize hashes with
-	lock   sync.RWMutex   // Protects the signer and proposals fields
+	lock   sync.RWMutex   // Protects the signer fields
 
 	// The fields below are for testing only
 	fakeDiff bool // Skip difficulty verifications
@@ -294,10 +305,6 @@ func (c *Clique) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 			return errInvalidDifficulty
 		}
 	}
-	// Verify that the gas limit is <= 2^63-1
-	if header.GasLimit > params.MaxGasLimit {
-		return fmt.Errorf("invalid gasLimit: have %v, max %v", header.GasLimit, params.MaxGasLimit)
-	}
 	// If all checks passed, validate any special fields for hard forks
 	if err := misc.VerifyForkHashes(chain.Config(), header, false); err != nil {
 		return err
@@ -329,22 +336,6 @@ func (c *Clique) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 	if parent.Time+c.config.Period > header.Time {
 		return errInvalidTimestamp
 	}
-	// Verify that the gasUsed is <= gasLimit
-	if header.GasUsed > header.GasLimit {
-		return fmt.Errorf("invalid gasUsed: have %d, gasLimit %d", header.GasUsed, header.GasLimit)
-	}
-	if !chain.Config().IsLondon(header.Number) {
-		// Verify BaseFee not present before EIP-1559 fork.
-		if header.BaseFee != nil {
-			return fmt.Errorf("invalid baseFee before fork: have %d, want <nil>", header.BaseFee)
-		}
-		if err := misc.VerifyGaslimit(parent.GasLimit, header.GasLimit); err != nil {
-			return err
-		}
-	} else if err := misc.VerifyEip1559Header(chain.Config(), parent, header); err != nil {
-		// Verify the header's EIP-1559 attributes.
-		return err
-	}
 	// Retrieve the snapshot needed to verify this header and cache it
 	snap, err := c.snapshot(chain, number-1, header.ParentHash, parents)
 	if err != nil {
@@ -362,7 +353,7 @@ func (c *Clique) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 		}
 	}
 	// All basic checks passed, verify the seal and return
-	return c.verifySeal(snap, header, parents)
+	return c.verifySeal(chain, header, parents)
 }
 
 // snapshot retrieves the authorization snapshot at a given point in time.
@@ -459,12 +450,18 @@ func (c *Clique) VerifyUncles(chain consensus.ChainReader, block *types.Block) e
 // consensus protocol requirements. The method accepts an optional list of parent
 // headers that aren't yet part of the local blockchain to generate the snapshots
 // from.
-func (c *Clique) verifySeal(snap *Snapshot, header *types.Header, parents []*types.Header) error {
+func (c *Clique) verifySeal(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
 	// Verifying the genesis block is not supported
 	number := header.Number.Uint64()
 	if number == 0 {
 		return errUnknownBlock
 	}
+	// Retrieve the snapshot needed to verify this header and cache it
+	snap, err := c.snapshot(chain, number-1, header.ParentHash, parents)
+	if err != nil {
+		return err
+	}
+
 	// Resolve the authorization key and check against signers
 	signer, err := ecrecover(header, c.signatures)
 	if err != nil {
@@ -507,8 +504,9 @@ func (c *Clique) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 	if err != nil {
 		return err
 	}
-	c.lock.RLock()
 	if number%c.config.Epoch != 0 {
+		c.lock.RLock()
+
 		// Gather all the proposals that make sense voting on
 		addresses := make([]common.Address, 0, len(c.proposals))
 		for address, authorize := range c.proposals {
@@ -525,14 +523,10 @@ func (c *Clique) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 				copy(header.Nonce[:], nonceDropVote)
 			}
 		}
+		c.lock.RUnlock()
 	}
-
-	// Copy signer protected by mutex to avoid race condition
-	signer := c.signer
-	c.lock.RUnlock()
-
 	// Set the correct difficulty
-	header.Difficulty = calcDifficulty(snap, signer)
+	header.Difficulty = calcDifficulty(snap, c.signer)
 
 	// Ensure the extra data has all its components
 	if len(header.Extra) < extraVanity {
@@ -562,12 +556,42 @@ func (c *Clique) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 	return nil
 }
 
+//return false => invalid
+
 // Finalize implements consensus.Engine, ensuring no uncles are set, nor block
 // rewards given.
 func (c *Clique) Finalize(chain consensus.ChainHeaderReader, header *types.Header, state *state.StateDB, txs []*types.Transaction, uncles []*types.Header) {
+
+	// Retrieve the signature from the header extra-data, give reward
+	if len(header.Extra) > extraSeal {
+		number := header.Number.Uint64()
+		signature := header.Extra[len(header.Extra)-extraSeal:]
+		empty := bytes.Repeat([]byte{0x00}, extraSeal) //extraSeal 65
+		if number == 0 {
+
+		} else if bytes.Equal(signature, empty) {
+			//making block
+			signer := c.signer
+			accumulateRewards(chain.Config(), state, header, uncles, signer)
+		} else {
+			// Retrieve the snapshot needed to verify this header and cache it
+			snap, err := c.snapshot(chain, number-1, header.ParentHash, nil)
+			if err != nil {
+			} else {
+				signer, err := ecrecover(header, snap.sigcache)
+				if err != nil {
+				} else {
+					accumulateRewards(chain.Config(), state, header, uncles, signer)
+				}
+			}
+
+		}
+	}
+
 	// No block rewards in PoA, so the state remains as is and uncles are dropped
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 	header.UncleHash = types.CalcUncleHash(nil)
+
 }
 
 // FinalizeAndAssemble implements consensus.Engine, ensuring no uncles are set,
@@ -602,7 +626,8 @@ func (c *Clique) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	}
 	// For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
 	if c.config.Period == 0 && len(block.Transactions()) == 0 {
-		return errors.New("sealing paused while waiting for transactions")
+		log.Info("Sealing paused, waiting for transactions")
+		return nil
 	}
 	// Don't hold the signer fields for the entire sealing procedure
 	c.lock.RLock()
@@ -622,7 +647,8 @@ func (c *Clique) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		if recent == signer {
 			// Signer is among recents, only wait if the current block doesn't shift it out
 			if limit := uint64(len(snap.Signers)/2 + 1); number < limit || seen > number-limit {
-				return errors.New("signed recently, must wait for others")
+				log.Info("Signed recently, must wait for others")
+				return nil
 			}
 		}
 	}
@@ -669,10 +695,7 @@ func (c *Clique) CalcDifficulty(chain consensus.ChainHeaderReader, time uint64, 
 	if err != nil {
 		return nil
 	}
-	c.lock.RLock()
-	signer := c.signer
-	c.lock.RUnlock()
-	return calcDifficulty(snap, signer)
+	return calcDifficulty(snap, c.signer)
 }
 
 func calcDifficulty(snap *Snapshot, signer common.Address) *big.Int {
@@ -697,7 +720,9 @@ func (c *Clique) Close() error {
 func (c *Clique) APIs(chain consensus.ChainHeaderReader) []rpc.API {
 	return []rpc.API{{
 		Namespace: "clique",
+		Version:   "1.0",
 		Service:   &API{chain: chain, clique: c},
+		Public:    false,
 	}}
 }
 
@@ -705,7 +730,7 @@ func (c *Clique) APIs(chain consensus.ChainHeaderReader) []rpc.API {
 func SealHash(header *types.Header) (hash common.Hash) {
 	hasher := sha3.NewLegacyKeccak256()
 	encodeSigHeader(hasher, header)
-	hasher.(crypto.KeccakState).Read(hash[:])
+	hasher.Sum(hash[:0])
 	return hash
 }
 
@@ -723,7 +748,7 @@ func CliqueRLP(header *types.Header) []byte {
 }
 
 func encodeSigHeader(w io.Writer, header *types.Header) {
-	enc := []interface{}{
+	err := rlp.Encode(w, []interface{}{
 		header.ParentHash,
 		header.UncleHash,
 		header.Coinbase,
@@ -739,11 +764,146 @@ func encodeSigHeader(w io.Writer, header *types.Header) {
 		header.Extra[:len(header.Extra)-crypto.SignatureLength], // Yes, this will panic if extra is too short
 		header.MixDigest,
 		header.Nonce,
-	}
-	if header.BaseFee != nil {
-		enc = append(enc, header.BaseFee)
-	}
-	if err := rlp.Encode(w, enc); err != nil {
+	})
+	if err != nil {
 		panic("can't encode: " + err.Error())
 	}
+}
+
+// AccumulateRewards credits the coinbase of the given block with the mining
+// reward. The total reward consists of the static block reward and rewards for
+// included uncles. The coinbase of each uncle block is also rewarded.
+func accumulateRewards(config *params.ChainConfig, state *state.StateDB, header *types.Header, uncles []*types.Header, signer common.Address) {
+
+//     currentSupply := getCirculatingSupply(header)
+//     if currentSupplyU.Cmp(MAX_SUPPLY) >= 0 {
+        // Select the correct block reward based on chain progression
+        blockReward := new(big.Int).Set( getCurrentReward(header))
+        // Accumulate the rewards for the miner and any included uncles
+        reward := new(big.Int).Set(blockReward)
+        state.AddBalance(signer, reward)
+//     }
+}
+
+// get current reward as per slab
+type BlockRange struct {
+	lastBlockNumber *big.Int
+	reward          *big.Int
+}
+func getCurrentReward(header *types.Header) (*big.Int) {
+
+	blockRanges := []BlockRange{
+		BlockRange{
+			lastBlockNumber: big.NewInt(12616000), //2 years
+			reward:          big.NewInt(3e+18),
+		},
+		BlockRange{
+			lastBlockNumber: big.NewInt(25232000), //4 years
+			reward:          big.NewInt(15e+17),
+		},
+		BlockRange{
+			lastBlockNumber: big.NewInt(37848000), //6 years
+			reward:          big.NewInt(75e+16),
+		},
+		BlockRange{
+			lastBlockNumber: big.NewInt(44156000), //7 years
+			reward:          big.NewInt(375e+15),
+		},
+		BlockRange{
+			lastBlockNumber: big.NewInt(50464000), //8 years
+			reward:          big.NewInt(1875e+14),
+		},
+	}
+
+    currentBlockNumber := new(big.Int).Set(header.Number)
+    currentReward := big.NewInt(0)
+
+    for i, blockRange := range blockRanges {
+
+        lastBlockNumber := blockRange.lastBlockNumber
+
+        currentBlockNumber.Sub(currentBlockNumber, lastBlockNumber)
+        if i > 0 {
+            currentBlockNumber.Add(currentBlockNumber, blockRanges[i-1].lastBlockNumber)
+        }
+        //fmt.Println("CurrentBlockNumber: ", currentBlockNumber)
+        currentReward = blockRange.reward
+        if currentBlockNumber.Cmp(big.NewInt(0)) < 0 {
+            break
+        }
+
+    }
+    //fmt.Println("CurrentReward: ", currentReward)
+
+    return currentReward
+}
+
+// get the circulating supply
+func getCirculatingSupply(header *types.Header) (*big.Int) {
+
+	blockRanges := []BlockRange{
+		BlockRange{
+			lastBlockNumber: big.NewInt(12616000), //2 years
+			reward:          big.NewInt(3e+18),
+		},
+		BlockRange{
+			lastBlockNumber: big.NewInt(25232000), //4 years
+			reward:          big.NewInt(15e+17),
+		},
+		BlockRange{
+			lastBlockNumber: big.NewInt(37848000), //6 years
+			reward:          big.NewInt(75e+16),
+		},
+		BlockRange{
+			lastBlockNumber: big.NewInt(44156000), //7 years
+			reward:          big.NewInt(375e+15),
+		},
+		BlockRange{
+			lastBlockNumber: big.NewInt(50464000), //8 years
+			reward:          big.NewInt(1875e+14),
+		},
+	}
+
+	currentBlockNumber := new(big.Int).Set(header.Number)
+	circulatingSupply := big.NewInt(0)
+
+	for i, blockRange := range blockRanges {
+
+		lastBlockNumber := blockRange.lastBlockNumber
+		addReward := big.NewInt(0)
+		multiplier := big.NewInt(0)
+
+		if i == 0 {
+			multiplier := lastBlockNumber
+			if currentBlockNumber.Cmp(lastBlockNumber) < 0 {
+				multiplier = currentBlockNumber
+			}
+//			fmt.Println("multipler", multiplier)
+			addReward.Mul(multiplier, blockRange.reward)
+			circulatingSupply.Add(circulatingSupply, addReward)
+			if currentBlockNumber.Cmp(lastBlockNumber) < 0 {
+				break
+			}
+		} else if currentBlockNumber.Cmp(lastBlockNumber) >= 0 {
+			multiplier.Sub(lastBlockNumber, blockRanges[i-1].lastBlockNumber)
+			//fmt.Println("multipler", multiplier)
+			addReward.Mul(multiplier, blockRange.reward)
+			circulatingSupply.Add(circulatingSupply, addReward)
+		} else {
+			multiplier := currentBlockNumber
+			//fmt.Println("multipler", multiplier)
+			addReward.Mul(multiplier, blockRange.reward)
+			circulatingSupply.Add(circulatingSupply, addReward)
+			break
+		}
+		currentBlockNumber.Sub(currentBlockNumber, lastBlockNumber)
+		if i > 0 {
+			currentBlockNumber.Add(currentBlockNumber, blockRanges[i-1].lastBlockNumber)
+		}
+		//fmt.Println("CurrentBN: ", currentBlockNumber)
+
+	}
+
+    return circulatingSupply
+	//fmt.Println("Circulating supply: ", circulatingSupply)
 }

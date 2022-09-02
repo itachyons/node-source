@@ -8,10 +8,10 @@ GOBIN = ./build/bin
 GO ?= latest
 GORUN = env GO111MODULE=on go run
 
-geth:
+tacnode:
 	$(GORUN) build/ci.go install ./cmd/geth
 	@echo "Done building."
-	@echo "Run \"$(GOBIN)/geth\" to launch geth."
+	@echo "Run \"$(GOBIN)/tacnode\" to launch iTachyon node."
 
 all:
 	$(GORUN) build/ci.go install
